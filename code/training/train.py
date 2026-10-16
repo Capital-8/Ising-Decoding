@@ -47,6 +47,7 @@ from training.precision import (
     module_to_channels_last_3d,
     input_to_channels_last_3d,
     targets_for_bce,
+    validate_precision_flags,
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
 try:
@@ -55,6 +56,7 @@ except Exception:
     SummaryWriter = None
 
 from training.distributed import DistributedManager
+from data.seed_layout import VALIDATION_SEED_OFFSET
 
 from training.utils import (
     load_checkpoint, save_checkpoint, load_latest_best_checkpoint_metadata, create_directory,
@@ -192,6 +194,30 @@ def get_accumulate_steps(epoch, cfg):
     per_device_batch_size = cfg.batch_schedule.initial
     unbounded_accumulate = current_per_device_batch_size // per_device_batch_size
     return min(max(unbounded_accumulate, 1), cfg.train.accumulate_steps)
+
+
+def _calculate_step_budgets(cfg, world_size, init_epoch):
+    """Keep the full LR schedule, but budget seeds only for this invocation."""
+    total_steps = 0
+    train_generator_steps = 0
+    max_val_generator_steps = 0
+    val_samples_per_rank = cfg.val.num_samples // world_size
+    for epoch in range(cfg.train.epochs):
+        per_device_bs = get_current_per_device_batch_size(epoch, cfg)
+        batches = compute_batches_per_epoch(cfg.train.num_samples, per_device_bs, world_size)
+        total_steps += max(1, math.ceil(batches / cfg.train.accumulate_steps))
+        if epoch >= init_epoch:
+            train_generator_steps += batches
+            val_batches = (val_samples_per_rank + per_device_bs - 1) // per_device_bs
+            max_val_generator_steps = max(max_val_generator_steps, val_batches)
+    return total_steps, train_generator_steps, max_val_generator_steps
+
+
+def maybe_convert_sync_batchnorm(model, enabled, world_size):
+    """Convert BatchNorm modules when synchronized DDP statistics are enabled."""
+    if not enabled or int(world_size) <= 1:
+        return model
+    return torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
 
 def get_curriculum_batch_sizes(cfg, epoch, num_pairs):
@@ -349,6 +375,20 @@ def validation_step(
     return avg_vloss
 
 
+def _parse_superbatch_size(value) -> int:
+    """Parse data.superbatch_size into a non-negative integer."""
+    if isinstance(value, str):
+        value = value.strip()
+        if value.lower() == "auto":
+            raise ValueError(
+                "data.superbatch_size='auto' is not implemented; use 0 or a fixed integer"
+            )
+    size = int(value or 0)
+    if size < 0:
+        raise ValueError(f"data.superbatch_size must be non-negative, got {size}")
+    return size
+
+
 def _generator_uses_compiled_generation(generator) -> bool:
     """True if the generator runs torch.compile'd HE during batch generation.
 
@@ -366,7 +406,10 @@ def _generator_uses_compiled_generation(generator) -> bool:
 
 
 def _should_use_outer_batch_prefetch(generator) -> bool:
-    """Outer ThreadPoolExecutor batch prefetch is safe only with eager generation."""
+    """Use exactly one prefetch layer, and never thread compiled generation."""
+    superbatch_active = getattr(generator, "superbatch_active", None)
+    if callable(superbatch_active) and superbatch_active():
+        return False
     return not _generator_uses_compiled_generation(generator)
 
 
@@ -429,10 +472,14 @@ def train_epoch(
     # when generation is eager.
     use_outer_prefetch = _should_use_outer_batch_prefetch(generator)
     if rank == 0 and not use_outer_prefetch:
-        print(
-            "[Train] Compiled data generation detected; disabling outer batch "
-            "prefetch (generation runs on the main thread)."
-        )
+        superbatch_active = getattr(generator, "superbatch_active", None)
+        if callable(superbatch_active) and superbatch_active():
+            print("[Train] Generator superbatch active; disabling outer minibatch prefetch.")
+        else:
+            print(
+                "[Train] Compiled data generation detected; disabling outer batch "
+                "prefetch (generation runs on the main thread)."
+            )
 
     with ThreadPoolExecutor(max_workers=1) as prefetch_pool:
         for step in range(steps_per_epoch):
@@ -726,11 +773,12 @@ def main(cfg: DictConfig) -> None:
     torch.backends.cuda.matmul.allow_tf32 = cfg.enable_matmul_tf32
     torch.backends.cudnn.allow_tf32 = cfg.enable_cudnn_tf32
 
-    # Set global precision
-    if cfg.enable_fp16:
-        torch.set_default_dtype(torch.float16)
-    elif getattr(cfg, 'enable_bf16', False):
-        torch.set_default_dtype(torch.bfloat16)
+    # Mixed precision is real AMP: parameters, BatchNorm running statistics and
+    # optimizer state stay fp32 and only the train/val forward passes run under
+    # autocast (see autocast_for_precision). The default dtype is left alone —
+    # switching it to bf16/fp16 would train native half-precision weights, which
+    # is not what the reference runs did and what the GradScaler setup assumes.
+    validate_precision_flags(cfg.enable_fp16, getattr(cfg, 'enable_bf16', False))
 
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = bool(cfg.enable_cudnn_benchmark)
@@ -1024,7 +1072,7 @@ def main(cfg: DictConfig) -> None:
         val_generator = MultiQCDataGeneratorTorch(
             mode='test',
             verbose=False,
-            base_seed=base_seed + 100_000_000,
+            base_seed=base_seed + VALIDATION_SEED_OFFSET,
             **_multi_common,
         )
     else:
@@ -1035,6 +1083,25 @@ def main(cfg: DictConfig) -> None:
                     "augmented DEM bundle (see qec.precompute_dem --code color)."
                 )
             from data.generator_torch_color import ColorQCDataGeneratorTorch
+            color_superbatch_size = _parse_superbatch_size(
+                OmegaConf.select(cfg, "data.superbatch_size", default=0)
+            )
+            color_superbatch_prefetch = bool(
+                OmegaConf.select(cfg, "data.superbatch_prefetch", default=False)
+            )
+            color_superbatch_interleave = bool(
+                OmegaConf.select(cfg, "data.superbatch_interleave_bases", default=False)
+            )
+            color_rank_seed_stride = OmegaConf.select(cfg, "data.rank_seed_stride", default=None)
+            if color_rank_seed_stride is not None:
+                color_rank_seed_stride = int(color_rank_seed_stride)
+            if dist.rank == 0 and color_superbatch_size > 0:
+                bases_mode = "interleaved X/Z" if color_superbatch_interleave else "basis-local"
+                print(
+                    "[Train] Color superbatching enabled: "
+                    f"size={color_superbatch_size}, prefetch={color_superbatch_prefetch}, "
+                    f"bases={bases_mode}"
+                )
             train_generator = ColorQCDataGeneratorTorch(
                 distance=cfg.distance,
                 n_rounds=cfg.n_rounds,
@@ -1054,7 +1121,13 @@ def main(cfg: DictConfig) -> None:
                 p_error=p_error_value,
                 p_min=p_min_value,
                 p_max=p_max_value,
+                superbatch_size=color_superbatch_size,
+                superbatch_prefetch=color_superbatch_prefetch,
+                superbatch_interleave_bases=color_superbatch_interleave,
+                rank_seed_stride=color_rank_seed_stride,
             )
+            # Validation generates directly: its steps are not contiguous with
+            # training's, so a resident buffer would be discarded every call.
             val_generator = ColorQCDataGeneratorTorch(
                 distance=cfg.distance,
                 n_rounds=cfg.n_rounds,
@@ -1068,12 +1141,15 @@ def main(cfg: DictConfig) -> None:
                 use_coset_search=color_use_coset_search,
                 rank=dist.local_rank,
                 global_rank=dist.rank,
-                base_seed=base_seed + 100_000_000,
+                base_seed=base_seed + VALIDATION_SEED_OFFSET,
                 verbose=False,
                 noise_model=noise_model_obj,
                 p_error=p_error_value,
                 p_min=p_min_value,
                 p_max=p_max_value,
+                superbatch_size=0,
+                superbatch_prefetch=False,
+                rank_seed_stride=color_rank_seed_stride,
             )
         else:
             # Surface code: Torch-only path (matches public/main).
@@ -1197,7 +1273,12 @@ def main(cfg: DictConfig) -> None:
         print("=" * 80)
 
     # Generate sample batch for shape info
-    sample_trainX, sample_trainY = train_generator.generate_batch(step=0, batch_size=1)
+    # Probe shapes directly: a batch_size of 1 does not divide the superbatch,
+    # and consuming a buffered slice here would desynchronize step accounting.
+    probe_generate = getattr(
+        train_generator, "generate_direct_batch", train_generator.generate_batch
+    )
+    sample_trainX, sample_trainY = probe_generate(step=0, batch_size=1)
     cfg.model.input_channels = sample_trainX.shape[1]
     cfg.model.out_channels = sample_trainY.shape[1]
 
@@ -1208,8 +1289,22 @@ def main(cfg: DictConfig) -> None:
         OmegaConf.select(cfg, "profiling.generator_subphases", default=False)
     )
 
-    # Create model
-    base_model = ModelFactory.create_model(cfg).to(dist.device)
+    # Create model. SyncBatchNorm conversion must happen before the device move
+    # and before DDP wrapping. Without it each rank normalizes with its own
+    # per-device batch statistics and the checkpointed running stats come from
+    # rank 0 alone. State-dict keys are unchanged, so checkpoints stay
+    # interchangeable between single- and multi-GPU runs.
+    base_model = ModelFactory.create_model(cfg)
+    sync_batchnorm_enabled = bool(OmegaConf.select(cfg, "sync_batchnorm", default=False))
+    if sync_batchnorm_enabled and dist.world_size > 1:
+        base_model = maybe_convert_sync_batchnorm(
+            base_model, enabled=True, world_size=dist.world_size
+        )
+        if dist.rank == 0:
+            print("[DDP] Using SyncBatchNorm across distributed ranks")
+    elif sync_batchnorm_enabled and dist.rank == 0:
+        print("[DDP] sync_batchnorm requested but world_size=1; keeping local BatchNorm")
+    base_model = base_model.to(dist.device)
 
     # Mixed precision is handled by autocast in the train/val steps; keep
     # parameters, BatchNorm state, and optimizer state in fp32. Only switch the
@@ -1275,12 +1370,14 @@ def main(cfg: DictConfig) -> None:
 
     # Print model summary (skipped if torchinfo isn't installed)
     if dist.rank == 0 and torchinfo is not None:
+        summary_model = ema_model if cfg.ema.use_ema else base_model
+        # torchinfo runs a real forward pass outside autocast; parameters are
+        # fp32 (real AMP), so the generator's fp32 sample matches as is.
         summary_input = sample_trainX.to(dist.device)
-        # Leave summary_input fp32; autocast handles precision. Match layout only.
         summary_input = input_to_channels_last_3d(summary_input, use_channels_last_3d)
 
         summary = torchinfo.summary(
-            ema_model if cfg.ema.use_ema else base_model,
+            summary_model,
             input_data=summary_input,
             verbose=0,
             depth=2,
@@ -1313,13 +1410,30 @@ def main(cfg: DictConfig) -> None:
     if dist.rank == 0:
         print(f"Calculating total_steps with {effective_num_samples:,} samples per epoch")
 
-    total_steps = 0
-    for epoch in range(cfg.train.epochs):
-        per_device_bs = get_current_per_device_batch_size(epoch, cfg)
-        acc = cfg.train.accumulate_steps
-        batches = compute_batches_per_epoch(effective_num_samples, per_device_bs, dist.world_size)
-        steps = max(1, math.ceil(batches / acc))
-        total_steps += steps
+    total_steps, total_generator_steps, max_val_generator_steps = _calculate_step_budgets(
+        cfg, dist.world_size, init_epoch_temp
+    )
+
+    # Per-rank data streams occupy a fixed seed range; a long run must not
+    # walk out of its own range into the next rank's. The generator knows its
+    # budget (it depends on whether superbatching is active) and fails fast.
+    # Generator steps restart at zero on resume, so only remaining epochs
+    # consume this invocation's seed range. The LR schedule still spans all epochs.
+    check_step_budget = getattr(train_generator, "check_step_budget", None)
+    if callable(check_step_budget):
+        check_step_budget(total_generator_steps)
+    # Validation reuses the same steps each epoch. Its shared 10000 offset
+    # shifts every rank equally, so the longest pass's batch count must fit.
+    # Use the validation generator's direct budget, not training's interleaved one.
+    check_val_step_budget = getattr(val_generator, "check_step_budget", None)
+    if callable(check_val_step_budget):
+        try:
+            check_val_step_budget(max_val_generator_steps)
+        except ValueError as exc:
+            raise ValueError(f"Validation seed budget exceeded: {exc}") from exc
+    check_seed_layout = getattr(train_generator, "check_seed_layout", None)
+    if callable(check_seed_layout):
+        check_seed_layout(world_size=dist.world_size)
 
     # Quick-validation guard: keep short runs from tripping scheduler constraints.
     # Full training runs keep the default warmup.
@@ -1497,6 +1611,13 @@ def main(cfg: DictConfig) -> None:
         )
 
         cumulative_steps += steps_per_epoch
+        # Free resident superbatch memory before validation allocates its own.
+        # The prefetched next superbatch is kept: it is the next epoch's first
+        # superbatch when the batch size does not change, and it is discarded
+        # by the buffer itself otherwise.
+        release_superbatch = getattr(train_generator, "release_superbatch", None)
+        if callable(release_superbatch):
+            release_superbatch(wait=True, keep_pending=True)
 
         model.eval()
         model_to_eval = ema_model if cfg.ema.use_ema else model
@@ -1730,6 +1851,11 @@ def main(cfg: DictConfig) -> None:
                 metadata={"epochs_completed": epoch + 1},
                 global_step=global_step,
             )
+
+    for generator in (train_generator, val_generator):
+        close_generator = getattr(generator, "close", None)
+        if callable(close_generator):
+            close_generator()
 
 
 if __name__ == "__main__":
