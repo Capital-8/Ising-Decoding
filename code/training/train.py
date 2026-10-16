@@ -58,7 +58,7 @@ from training.distributed import DistributedManager
 
 from training.utils import (
     load_checkpoint, save_checkpoint, load_latest_best_checkpoint_metadata, create_directory,
-    should_stop_due_to_time, compare_receptive_field_with_window_data
+    should_stop_due_to_time, compare_receptive_field_with_window_data, compute_batches_per_epoch
 )
 from model.factory import ModelFactory
 
@@ -82,8 +82,14 @@ from qec.surface_code.data_mapping import (
 
 
 def _sync_cuda_if_needed(device=None):
-    if torch.cuda.is_available():
-        torch.cuda.synchronize(device=device)
+    # Both conditions matter: CUDA being available says nothing about where this
+    # run's tensors live. Synchronizing a CPU device raises "Expected a cuda
+    # device", so a CPU run on a GPU machine would crash here.
+    if not torch.cuda.is_available():
+        return
+    if device is not None and torch.device(device).type != "cuda":
+        return
+    torch.cuda.synchronize(device=device)
 
 
 def _accumulate_numeric_timing(accumulator, sample):
@@ -404,6 +410,7 @@ def train_epoch(
     last_loss = 0.0
     epoch_total_loss = 0.0
     accumulated_samples = 0
+    accumulated_batches = 0
     profile_sums = {}
     profile_count = 0
 
@@ -501,8 +508,10 @@ def train_epoch(
                 _sync_cuda_if_needed(device)
                 model_fwd_bwd_s = time.perf_counter() - model_t0
             accumulated_samples += current_batch_size
+            accumulated_batches += 1
 
-            if (step + 1) % accumulate_steps == 0:
+            should_update = ((step + 1) % accumulate_steps == 0 or step + 1 == steps_per_epoch)
+            if should_update:
                 if profile_enabled:
                     _sync_cuda_if_needed(device)
                     opt_t0 = time.perf_counter()
@@ -556,15 +565,16 @@ def train_epoch(
             running_loss += batch_loss_mean
             epoch_total_loss += batch_loss_mean
 
-            if (step + 1) % accumulate_steps == 0:
-                last_loss = running_loss / accumulate_steps
-                if rank == 0:
+            if should_update:
+                last_loss = running_loss / accumulated_batches
+                if rank == 0 and tb_writer is not None:
                     tb_writer.add_scalar('Loss/train_step', last_loss, global_step)
                     tb_writer.add_scalar(
                         'LearningRate/train',
                         scheduler.get_last_lr()[0], global_step
                     )
                 running_loss = 0.0
+                accumulated_batches = 0
 
             # Get the next batch: from the prefetch worker (eager generation) or
             # synchronously on the main thread (compiled generation).
@@ -650,22 +660,23 @@ def train_epoch(
                     f"dlpack={avg.get('dlpack_s', 0.0) * 1000:.1f}ms | "
                     f"format={avg.get('format_s', 0.0) * 1000:.1f}ms"
                 )
-            tb_writer.add_scalar(
-                'Timing/generator_total_ms',
-                avg.get('generator_total_s', 0.0) * 1000, epoch_number
-            )
-            tb_writer.add_scalar(
-                'Timing/future_wait_ms',
-                avg.get('future_wait_s', 0.0) * 1000, epoch_number
-            )
-            tb_writer.add_scalar(
-                'Timing/model_fwd_bwd_ms',
-                avg.get('model_fwd_bwd_s', 0.0) * 1000, epoch_number
-            )
-            tb_writer.add_scalar(
-                'Timing/optimizer_step_ms',
-                avg.get('optimizer_step_s', 0.0) * 1000, epoch_number
-            )
+            if tb_writer is not None:
+                tb_writer.add_scalar(
+                    'Timing/generator_total_ms',
+                    avg.get('generator_total_s', 0.0) * 1000, epoch_number
+                )
+                tb_writer.add_scalar(
+                    'Timing/future_wait_ms',
+                    avg.get('future_wait_s', 0.0) * 1000, epoch_number
+                )
+                tb_writer.add_scalar(
+                    'Timing/model_fwd_bwd_ms',
+                    avg.get('model_fwd_bwd_s', 0.0) * 1000, epoch_number
+                )
+                tb_writer.add_scalar(
+                    'Timing/optimizer_step_ms',
+                    avg.get('optimizer_step_s', 0.0) * 1000, epoch_number
+                )
 
     return avg_loss, global_step
 
@@ -1306,7 +1317,7 @@ def main(cfg: DictConfig) -> None:
     for epoch in range(cfg.train.epochs):
         per_device_bs = get_current_per_device_batch_size(epoch, cfg)
         acc = cfg.train.accumulate_steps
-        batches = effective_num_samples // (per_device_bs * dist.world_size)
+        batches = compute_batches_per_epoch(effective_num_samples, per_device_bs, dist.world_size)
         steps = max(1, math.ceil(batches / acc))
         total_steps += steps
 
@@ -1352,7 +1363,9 @@ def main(cfg: DictConfig) -> None:
     # Calculate steps per epoch
     per_device_bs0 = get_current_per_device_batch_size(0, cfg)
     acc0 = cfg.train.accumulate_steps
-    batches_per_epoch = effective_num_samples // (per_device_bs0 * dist.world_size)
+    batches_per_epoch = compute_batches_per_epoch(
+        effective_num_samples, per_device_bs0, dist.world_size
+    )
     steps_per_epoch_estimate = math.ceil(batches_per_epoch / acc0)
 
     # Load optimizer/scheduler/scaler state
@@ -1435,7 +1448,9 @@ def main(cfg: DictConfig) -> None:
             per_device_batch_size = get_current_per_device_batch_size(epoch, cfg)
             accumulate_steps = cfg.train.accumulate_steps
             effective_batch_size = per_device_batch_size * accumulate_steps * dist.world_size
-            steps_per_epoch = effective_num_samples // effective_batch_size
+            steps_per_epoch = compute_batches_per_epoch(
+                effective_num_samples, per_device_batch_size, dist.world_size
+            )
 
             if dist.rank == 0:
                 print(
@@ -1446,7 +1461,8 @@ def main(cfg: DictConfig) -> None:
                     f"({per_device_batch_size} × {accumulate_steps} × {dist.world_size})"
                 )
                 # Log batch size to TensorBoard
-                writer.add_scalar("BatchSize", effective_batch_size, epoch_number)
+                if writer is not None:
+                    writer.add_scalar("BatchSize", effective_batch_size, epoch_number)
 
         model.train(True)
 
@@ -1605,28 +1621,29 @@ def main(cfg: DictConfig) -> None:
             else:
                 print(f"[{timestamp}] LOSS train {avg_loss:.5f} valid {avg_vloss:.5f}")
 
-            # Log Loss to TensorBoard
-            writer.add_scalars(
-                "Loss", {
-                    "Training": avg_loss,
-                    "Validation": avg_vloss
-                }, epoch_number
-            )
+            if writer is not None:
+                # Log Loss to TensorBoard
+                writer.add_scalars(
+                    "Loss", {
+                        "Training": avg_loss,
+                        "Validation": avg_vloss
+                    }, epoch_number
+                )
 
-            # Log LER to TensorBoard (important evaluation metric)
-            # Color code reports LER per round; surface code reports total LER
-            if validation_ler is not None:
-                writer.add_scalar(f"Metrics/{ler_label}", validation_ler, epoch_number)
-                if ler_reduction_factor is not None:
-                    writer.add_scalar(
-                        "Metrics/LER_Reduction_Factor", ler_reduction_factor, epoch_number
-                    )
+                # Log LER to TensorBoard (important evaluation metric)
+                # Color code reports LER per round; surface code reports total LER
+                if validation_ler is not None:
+                    writer.add_scalar(f"Metrics/{ler_label}", validation_ler, epoch_number)
+                    if ler_reduction_factor is not None:
+                        writer.add_scalar(
+                            "Metrics/LER_Reduction_Factor", ler_reduction_factor, epoch_number
+                        )
 
-            # Log Syndrome Density Reduction to TensorBoard (important evaluation metric)
-            if syndrome_density_reduction is not None:
-                writer.add_scalar("Metrics/SDR", syndrome_density_reduction, epoch_number)
+                # Log Syndrome Density Reduction to TensorBoard (important evaluation metric)
+                if syndrome_density_reduction is not None:
+                    writer.add_scalar("Metrics/SDR", syndrome_density_reduction, epoch_number)
 
-            writer.flush()
+                writer.flush()
 
         if dist.world_size > 1:
             torch.distributed.barrier()
@@ -1679,7 +1696,7 @@ def main(cfg: DictConfig) -> None:
                 break
 
         # Log early stopping metrics to TensorBoard
-        if dist.rank == 0:
+        if dist.rank == 0 and writer is not None:
             writer.add_scalar("EarlyStopping/epochs_since_best", epochs_since_best, epoch_number)
             writer.add_scalar("EarlyStopping/best_metric", best_vloss, epoch_number)
             if syndrome_density_reduction is not None:
